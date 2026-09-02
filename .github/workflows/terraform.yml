@@ -1,0 +1,118 @@
+name: Terraform (OIDC + policy validator)
+
+# Manual trigger: this workflow applies real (if free-tier) AWS resources and then
+# destroys them in the same run. workflow_dispatch avoids doing that on every push.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    environment: aws-demo
+    defaults:
+      run:
+        working-directory: infra
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.0"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-demo/gha-demo-ci-role
+          aws-region: us-east-1
+
+      - name: Prove the assumed identity
+        run: aws sts get-caller-identity --no-cli-pager
+
+      - name: terraform init
+        run: terraform init
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive
+
+      - name: terraform validate
+        run: terraform validate
+
+      - name: terraform plan
+        run: |
+          terraform plan -out=tf.plan
+          terraform show -json -no-color tf.plan > tf.json
+
+      - name: Filter plan JSON for tf-policy-validator
+        # See PLAN.md / README Phase 0: Terraform 1.12+ plan JSON includes
+        # identity/identity_schema_version fields that crash tf-policy-validator 0.0.9
+        # (github.com/awslabs/terraform-iam-policy-validator issue #42).
+        run: jq 'del(.. | .identity?, .identity_schema_version?)' tf.json > tf.clean.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tf-policy-validator
+        run: pip install tf-policy-validator
+
+      - name: Policy validation gate -- validate
+        run: |
+          tf-policy-validator validate \
+            --config ../policy-validator/config.yaml \
+            --template-path tf.clean.json \
+            --region us-east-1 \
+            --treat-finding-type-as-blocking ERROR,SECURITY_WARNING
+
+      - name: Policy validation gate -- check-no-new-access
+        run: |
+          tf-policy-validator check-no-new-access \
+            --config ../policy-validator/config.yaml \
+            --template-path tf.clean.json \
+            --region us-east-1 \
+            --reference-policy ../policy-validator/reference-policy.json \
+            --reference-policy-type identity
+
+      - name: Policy validation gate -- check-access-not-granted
+        run: |
+          tf-policy-validator check-access-not-granted \
+            --config ../policy-validator/config.yaml \
+            --template-path tf.clean.json \
+            --region us-east-1 \
+            --actions "iam:CreateUser,iam:PassRole,s3:DeleteBucket"
+
+      - name: Policy validation gate -- check-no-public-access
+        run: |
+          tf-policy-validator check-no-public-access \
+            --config ../policy-validator/config.yaml \
+            --template-path tf.clean.json \
+            --region us-east-1
+
+      - name: terraform apply
+        run: terraform apply -auto-approve tf.plan
+
+      - name: Verify resources exist
+        run: |
+          aws s3api head-bucket --bucket "$(terraform output -raw bucket_name)" --no-cli-pager
+          aws sqs get-queue-attributes --queue-url "$(terraform output -raw queue_url)" --attribute-names QueueArn --no-cli-pager
+          aws sns get-topic-attributes --topic-arn "$(terraform output -raw topic_arn)" --query 'Attributes.TopicArn' --no-cli-pager
+          aws dynamodb describe-table --table-name "$(terraform output -raw table_name)" --query 'Table.TableStatus' --no-cli-pager
+          aws logs describe-log-groups --log-group-name-prefix "$(terraform output -raw log_group_name)" --query 'logGroups[0].logGroupName' --no-cli-pager
+          aws iam get-role --role-name "$(basename "$(terraform output -raw app_role_arn)")" --query 'Role.Arn' --no-cli-pager
+
+      - name: terraform destroy
+        if: always()
+        run: terraform destroy -auto-approve
+
+      - name: Verify teardown
+        if: always()
+        run: |
+          BUCKET_OUT=$(aws s3api head-bucket --bucket "gha-demo-app-123456789012" --no-cli-pager 2>&1) || true
+          echo "$BUCKET_OUT" | grep -q "Not Found" && echo "bucket gone: OK" || { echo "bucket teardown not confirmed: $BUCKET_OUT"; exit 1; }
+
+          TABLE_OUT=$(aws dynamodb describe-table --table-name gha-demo-app-table --no-cli-pager 2>&1) || true
+          echo "$TABLE_OUT" | grep -q "ResourceNotFoundException" && echo "table gone: OK" || { echo "table teardown not confirmed: $TABLE_OUT"; exit 1; }
