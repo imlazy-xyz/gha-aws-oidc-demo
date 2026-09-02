@@ -10,6 +10,7 @@ permissions:
 jobs:
   show-claims:
     runs-on: ubuntu-latest
+    environment: aws-demo
     steps:
       - name: Show OIDC claims
         run: |
