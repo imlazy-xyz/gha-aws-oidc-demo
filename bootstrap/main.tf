@@ -63,6 +63,21 @@ resource "aws_iam_policy" "ci_boundary" {
         Resource = "*"
       },
       {
+        # Iteration 4 (Phase 5, real CI run): tf-policy-validator itself calls
+        # access-analyzer:ValidatePolicy etc. under the CI role's assumed identity.
+        # Same lesson as the iam:ListPolicies fix above -- the boundary blocks this
+        # even though ci_workload's identity policy already grants it.
+        Sid    = "AllowAccessAnalyzerValidator"
+        Effect = "Allow"
+        Action = [
+          "access-analyzer:ValidatePolicy",
+          "access-analyzer:CheckNoNewAccess",
+          "access-analyzer:CheckAccessNotGranted",
+          "access-analyzer:CheckNoPublicAccess",
+        ]
+        Resource = "*"
+      },
+      {
         Sid      = "AllowIamListForBoundaryLookup"
         Effect   = "Allow"
         Action   = ["iam:ListPolicies"]
