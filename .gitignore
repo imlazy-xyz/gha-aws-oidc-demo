@@ -1,0 +1,9 @@
+.venv/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tf.plan
+tf.json
+tf.clean.json
+.terraform/
+crash.log
