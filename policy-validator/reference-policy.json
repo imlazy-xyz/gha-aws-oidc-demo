@@ -1,0 +1,35 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3ReadWrite",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::gha-demo-app-123456789012/*"
+    },
+    {
+      "Sid": "QueueSendReceive",
+      "Effect": "Allow",
+      "Action": ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage"],
+      "Resource": "arn:aws:sqs:us-east-1:123456789012:gha-demo-app-queue"
+    },
+    {
+      "Sid": "TopicPublish",
+      "Effect": "Allow",
+      "Action": ["sns:Publish"],
+      "Resource": "arn:aws:sns:us-east-1:123456789012:gha-demo-app-topic"
+    },
+    {
+      "Sid": "TableReadWrite",
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:GetItem"],
+      "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/gha-demo-app-table"
+    },
+    {
+      "Sid": "LogWrite",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:us-east-1:123456789012:log-group:/gha-demo/app:*"
+    }
+  ]
+}

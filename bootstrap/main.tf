@@ -41,6 +41,12 @@ resource "aws_iam_policy" "ci_boundary" {
   name        = "gha-demo-ci-boundary"
   description = "Permissions boundary for roles created by the GitHub Actions CI role"
 
+  # NOTE: this boundary is attached to the CI role itself (see aws_iam_role.ci below),
+  # not only to roles the CI role creates. That means it also caps what the CI role can
+  # do directly -- iteration 2 of Phase 3 hit this: the boundary blocked the CI role's
+  # own iam:ListPolicies / iam:GetPolicy calls (needed to look up this very policy by
+  # name) even though the CI role's identity policy granted them. iam read/write actions
+  # scoped to the /gha-demo/ path are included here for that reason.
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -55,6 +61,36 @@ resource "aws_iam_policy" "ci_boundary" {
           "logs:*",
         ]
         Resource = "*"
+      },
+      {
+        Sid      = "AllowIamListForBoundaryLookup"
+        Effect   = "Allow"
+        Action   = ["iam:ListPolicies"]
+        Resource = "*"
+      },
+      {
+        Sid    = "AllowIamManagementUnderPath"
+        Effect = "Allow"
+        Action = [
+          "iam:GetPolicy",
+          "iam:GetPolicyVersion",
+          "iam:GetRole",
+          "iam:CreateRole",
+          "iam:DeleteRole",
+          "iam:UpdateRole",
+          "iam:PutRolePolicy",
+          "iam:GetRolePolicy",
+          "iam:DeleteRolePolicy",
+          "iam:TagRole",
+          "iam:UntagRole",
+          "iam:ListRolePolicies",
+          "iam:ListAttachedRolePolicies",
+          "iam:ListInstanceProfilesForRole",
+        ]
+        Resource = [
+          "arn:aws:iam::*:role/gha-demo/*",
+          "arn:aws:iam::*:policy/gha-demo-ci-boundary",
+        ]
       }
     ]
   })

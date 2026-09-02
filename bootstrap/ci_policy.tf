@@ -48,6 +48,22 @@ resource "aws_iam_role_policy" "ci_workload" {
         Effect = "Allow"
         Action = ["iam:*"]
         Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/gha-demo/*"
+      },
+      {
+        # Iteration 1 (AccessDenied): infra/main.tf looks up the permissions boundary
+        # policy by name via `data "aws_iam_policy"`, which calls iam:ListPolicies --
+        # a list-type action that IAM does not support scoping to a single resource ARN,
+        # so it must be Resource: "*". iam:GetPolicy is scoped to the specific boundary.
+        Sid      = "ReadBoundaryPolicy"
+        Effect   = "Allow"
+        Action   = ["iam:ListPolicies"]
+        Resource = "*"
+      },
+      {
+        Sid      = "GetBoundaryPolicy"
+        Effect   = "Allow"
+        Action   = ["iam:GetPolicy", "iam:GetPolicyVersion"]
+        Resource = aws_iam_policy.ci_boundary.arn
       }
     ]
   })
