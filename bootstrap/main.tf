@@ -62,9 +62,12 @@ resource "aws_iam_policy" "ci_boundary" {
 
 # --- CI role -------------------------------------------------------------------------
 #
-# Trust policy starts loose (StringLike on the whole repo) so we can discover the real
-# `sub` claim from a live token (see README Phase 2), then gets tightened to StringEquals
-# on the exact observed sub, scoped to the "aws-demo" GitHub environment.
+# Trust policy tightened to StringEquals on the exact `sub` observed from a live token
+# issued for the "aws-demo" GitHub environment (see README Phase 2). This repo was
+# created after GitHub's 2026-07-15 cutover, so the sub uses the immutable-ID format
+# (owner@owner-id/repo@repo-id) rather than the legacy owner/repo form -- a loose
+# StringLike on "repo:imlazy-xyz/gha-aws-oidc-demo:*" was used only to discover this
+# value and is intentionally not what ships here.
 resource "aws_iam_role" "ci" {
   name                 = "gha-demo-ci-role"
   path                 = "/gha-demo/"
@@ -82,9 +85,7 @@ resource "aws_iam_role" "ci" {
         Condition = {
           StringEquals = {
             "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          }
-          StringLike = {
-            "token.actions.githubusercontent.com:sub" = "repo:imlazy-xyz/gha-aws-oidc-demo:*"
+            "token.actions.githubusercontent.com:sub" = "repo:imlazy-xyz@1752641/gha-aws-oidc-demo@1354514600:environment:aws-demo"
           }
         }
       }

@@ -17,3 +17,12 @@ jobs:
           TOKEN=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
           echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | jq '{sub, aud, repository, repository_id, repository_owner, repository_owner_id, ref}'
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-demo/gha-demo-ci-role
+          aws-region: us-east-1
+
+      - name: Prove the assumed role
+        run: aws sts get-caller-identity --no-cli-pager
