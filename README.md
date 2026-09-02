@@ -800,4 +800,174 @@ not, as the flag name might suggest, a list of actions to check.
 
 ---
 
+## Phase 5 — GitHub Actions workflow
+
+`.github/workflows/terraform.yml` ties everything together: OIDC auth → `terraform plan` → all four
+`tf-policy-validator` gates → `terraform apply` → CLI verification → `terraform destroy`.
+
+```yaml
+on:
+  workflow_dispatch:   # applies real resources then destroys them in the same run
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    environment: aws-demo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: "1.16.0" }
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-demo/gha-demo-ci-role
+          aws-region: us-east-1
+
+      - run: terraform init
+      - run: terraform fmt -check -recursive
+      - run: terraform validate
+      - run: |
+          terraform plan -out=tf.plan
+          terraform show -json -no-color tf.plan > tf.json
+      - run: jq 'del(.. | .identity?, .identity_schema_version?)' tf.json > tf.clean.json
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install tf-policy-validator
+
+      # four validator gates (validate, check-no-new-access,
+      # check-access-not-granted, check-no-public-access) -- non-zero exit fails the job
+
+      - run: terraform apply -auto-approve tf.plan
+      - run: |  # verify via aws CLI using terraform outputs
+      - run: terraform destroy -auto-approve
+        if: always()
+      - run: |  # verify teardown
+        if: always()
+```
+
+Chose `workflow_dispatch` (manual trigger) rather than running on every push, since this workflow
+applies real AWS resources and destroys them in the same run — appropriate for a demo/tutorial
+pipeline, not something you'd want firing on every commit.
+
+Before committing, every `tf-policy-validator` flag used was checked against `--help` output rather
+than trusted from memory (`validate --treat-finding-type-as-blocking ERROR,SECURITY_WARNING`;
+`check-no-new-access`/`check-access-not-granted --treat-findings-as-non-blocking`) — all confirmed
+correct.
+
+**Bash pipefail gotcha, caught before committing (not after a failed run):** GitHub Actions runs
+`bash` steps with `-eo pipefail` by default. A step like
+`aws ... | grep -q "Not Found" && echo ok` fails the whole step if the `aws` command itself errors
+(nonzero), *even when* `grep` finds its match — because `pipefail` reports the pipeline's exit as the
+last non-zero exit among all stages, not just the final command. Fixed by capturing output into a
+variable first, then grepping the variable (no pipe involved):
+```bash
+BUCKET_OUT=$(aws s3api head-bucket --bucket "..." 2>&1) || true
+echo "$BUCKET_OUT" | grep -q "Not Found" && echo "bucket gone: OK" || { echo "..."; exit 1; }
+```
+
+## Phase 6 — Running the workflow for real
+
+### First run: caught one more real permissions bug
+
+```bash
+gh workflow run terraform.yml --repo imlazy-xyz/gha-aws-oidc-demo
+```
+
+[Run 33613750202](https://github.com/imlazy-xyz/gha-aws-oidc-demo/actions/runs/33613750202) — failed
+at the first validator gate:
+
+```
+botocore.errorfactory.AccessDeniedException: An error occurred (AccessDeniedException) when calling
+the ValidatePolicy operation: User: arn:aws:sts::123456789012:assumed-role/gha-demo-ci-role/GitHubActions
+is not authorized to perform: access-analyzer:ValidatePolicy on resource:
+arn:aws:access-analyzer:us-east-1:123456789012:* because no permissions boundary allows the
+access-analyzer:ValidatePolicy action
+```
+
+**Same bug class as Phase 3's iteration 2**: `access-analyzer:*` was granted in the CI role's
+identity policy (`ci_workload`) but never added to the permissions boundary (`ci_boundary`) that
+also applies to the CI role itself. `terraform destroy` still ran (via `if: always()`) — harmlessly,
+since `terraform apply` never got far enough to create anything.
+
+Fixed the boundary the same way as before:
+```hcl
+{
+  Sid    = "AllowAccessAnalyzerValidator"
+  Effect = "Allow"
+  Action = ["access-analyzer:ValidatePolicy", "access-analyzer:CheckNoNewAccess",
+            "access-analyzer:CheckAccessNotGranted", "access-analyzer:CheckNoPublicAccess"]
+  Resource = "*"
+}
+```
+Applied locally with `terraform apply` in `bootstrap/`, committed, pushed.
+
+### Second run: fully green, end to end
+
+```bash
+gh workflow run terraform.yml --repo imlazy-xyz/gha-aws-oidc-demo
+gh run watch 33614042453 --repo imlazy-xyz/gha-aws-oidc-demo --exit-status
+```
+
+[Run 33614042453](https://github.com/imlazy-xyz/gha-aws-oidc-demo/actions/runs/33614042453) —
+**every step green**, exit code 0:
+
+```
+✓ Configure AWS credentials via OIDC
+✓ Prove the assumed identity
+✓ terraform init / fmt -check / validate / plan
+✓ Filter plan JSON for tf-policy-validator
+✓ Policy validation gate -- validate
+✓ Policy validation gate -- check-no-new-access
+✓ Policy validation gate -- check-access-not-granted
+✓ Policy validation gate -- check-no-public-access
+✓ terraform apply
+✓ Verify resources exist
+✓ terraform destroy
+✓ Verify teardown
+```
+
+Real output pulled from the run log:
+
+```
+Apply complete! Resources: 12 added, 0 changed, 0 destroyed.
+```
+```json
+{
+    "BucketArn": "arn:aws:s3:::gha-demo-app-123456789012",
+    "BucketRegion": "us-east-1",
+    "AccessPointAlias": false
+}
+```
+```
+Destroy complete! Resources: 12 destroyed.
+bucket gone: OK
+table gone: OK
+```
+
+### Verified independently, outside the workflow
+
+```bash
+aws s3 ls | grep gha-demo                                    # -> only the (intentional) state bucket
+aws dynamodb list-tables --query 'TableNames'                 # -> []
+aws sqs list-queues --query 'QueueUrls'                        # -> null (none)
+aws sns list-topics --query 'Topics[].TopicArn' | grep gha-demo  # -> (no output)
+aws iam list-roles --path-prefix /gha-demo/ --query 'Roles[].RoleName'  # -> only gha-demo-ci-role
+```
+
+Only the `bootstrap/`-owned state bucket and CI role remain — exactly as expected, since those are
+torn down separately in Phase 7. The disposable workload leaves nothing behind.
+
+**This is the complete, verified proof of the whole tutorial**: GitHub Actions authenticated to AWS
+via OIDC with no stored credentials, a real Terraform plan was gated by `tf-policy-validator` (with
+two deliberately-triggered findings caught earlier in Phase 4), the workload was applied for real,
+verified via independent CLI calls, and cleanly destroyed — twice over, once inside the workflow and
+once confirmed from outside it.
+
+---
+
 *(Tutorial continues below as later phases are implemented and verified.)*
