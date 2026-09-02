@@ -45,7 +45,7 @@ arnServiceMap:
   aws_sns_topic: name?fakename
   aws_sns_topic_policy: arn?fakename
   aws_sqs_queue: name?fakename
-  aws_sqs_queue_policy: fakeQueueUrl
+  aws_sqs_queue_policy: ?fakeQueueUrl
   aws_ssoadmin_permission_set_inline_policy: instance_arn?fakeSSOInstanceArn
   aws_sagemaker_model_package_group_policy: model_package_group_name?fakeModelPackageGroupName 
   aws_secretsmanager_secret: name?fakename

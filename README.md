@@ -617,4 +617,187 @@ rather than retrofitted, since the failure only shows up after the fact.
 
 ---
 
+## Phase 4 — Validator integration against the real infra
+
+With `infra/` deployed, generated a fresh plan and ran all four `tf-policy-validator` subcommands
+against it — the same `jq`-filtered pattern from Phase 0.
+
+```bash
+cd infra
+terraform plan -out tf.plan
+terraform show -json -no-color tf.plan > tf.json
+jq 'del(.. | .identity?, .identity_schema_version?)' tf.json > tf.clean.json
+```
+
+### Second validator bug found: `aws_sqs_queue_policy` crashes on the shipped config
+
+```bash
+tf-policy-validator validate --config policy-validator/config.yaml --template-path infra/tf.clean.json --region us-east-1
+```
+```
+KeyError: 'Invalid Key: aws_sqs_queue_policy.app.fakeQueueUrl'
+```
+
+Traced into the tool's own source
+(`iam_check/lib/tfPlan.py:getResourceName`): an `arnServiceMap` entry is only treated as "attribute,
+with a static fallback" when it contains a `?` separator (`key?default`). Without one, the whole
+string is treated as a literal Terraform attribute name to read off the resource — and the shipped
+`iam_check/config/default.yaml` has several entries with **no `?`**, including exactly the one this
+workload hits:
+
+```yaml
+aws_sqs_queue_policy: fakeQueueUrl   # <- no "?", so "fakeQueueUrl" is read as an attribute name
+```
+
+Since `aws_sqs_queue_policy` has no attribute literally called `fakeQueueUrl`, the lookup raises an
+uncaught `KeyError`. (The same bug class affects `aws_codebuild_resource_policy`,
+`aws_ecr_registry_policy`, `aws_glue_resource_policy`, the four `aws_kms_*` entries, and
+`aws_vpc_endpoint` in the shipped config — same missing `?`, not independently tested here since this
+workload doesn't touch them.)
+
+**Fix** — a one-line local patch to `policy-validator/config.yaml`, changing it to an empty
+attribute key so it always falls through to the static default rather than depending on any real
+attribute existing at plan time (SQS's `queue_url`/`id` are `(known after apply)` before creation, so
+even a real attribute name would fail on a first-time plan):
+
+```diff
+- aws_sqs_queue_policy: fakeQueueUrl
++ aws_sqs_queue_policy: ?fakeQueueUrl
+```
+
+Re-running `validate` after the fix:
+
+```json
+{
+    "BlockingFindings": [],
+    "NonBlockingFindings": [
+        {
+            "findingType": "SUGGESTION",
+            "code": "EMPTY_ARRAY_RESOURCE",
+            "message": "This statement includes no resources and does not affect the policy. Specify resources.",
+            "resourceName": "gha-demo-app-role",
+            "policyName": "aws_iam_role.app"
+        }
+    ]
+}
+```
+Exit code 0. The one suggestion is expected and benign — Lambda trust policies have no `Resource`
+element by design.
+
+### `check-no-new-access` against the real infra
+
+`policy-validator/reference-policy.json` holds the app role's identity policy exactly as originally
+written (scoped `s3:GetObject`/`PutObject` on the bucket, `sqs:Send/Receive/DeleteMessage` on the
+queue, `sns:Publish` on the topic, `dynamodb:PutItem`/`GetItem` on the table,
+`logs:CreateLogStream`/`PutLogEvents` on the log group) — the approved baseline this check answers
+"has this PR granted more than that?" against.
+
+```bash
+tf-policy-validator check-no-new-access --config policy-validator/config.yaml \
+  --template-path infra/tf.clean.json --region us-east-1 \
+  --reference-policy policy-validator/reference-policy.json --reference-policy-type identity
+```
+```json
+{"BlockingFindings": [], "NonBlockingFindings": []}
+```
+Exit 0 — matches the baseline exactly, as expected.
+
+### `check-access-not-granted` and `check-no-public-access` against the real infra
+
+```bash
+tf-policy-validator check-access-not-granted --config policy-validator/config.yaml \
+  --template-path infra/tf.clean.json --region us-east-1 \
+  --actions "iam:CreateUser,iam:PassRole,s3:DeleteBucket"
+
+tf-policy-validator check-no-public-access --config policy-validator/config.yaml \
+  --template-path infra/tf.clean.json --region us-east-1
+```
+Both return `{"BlockingFindings": [], "NonBlockingFindings": []}`, exit 0 — the app role can't create
+IAM users, pass roles, or delete the bucket, and no resource policy is public.
+
+### Deliberate finding #1: `check-no-new-access` catches a policy widening
+
+Temporarily widened the app role's S3 statement from scoped actions on one bucket to `s3:*` on `*`:
+
+```diff
+- Action   = ["s3:GetObject", "s3:PutObject"]
+- Resource = "${aws_s3_bucket.app.arn}/*"
++ Action   = ["s3:*"]
++ Resource = "*"
+```
+
+Re-ran `check-no-new-access` against a fresh plan of the widened config:
+
+```json
+{
+    "BlockingFindings": [
+        {
+            "findingType": "SECURITY_WARNING",
+            "code": "policy-analysis-CheckNoNewAccess",
+            "message": "The modified permissions grant new access compared to your existing policy.",
+            "resourceName": "gha-demo-app-policy",
+            "details": {
+                "result": "FAIL",
+                "reasons": [
+                    { "description": "New access in the statement with sid: S3ReadWrite.", "statementId": "S3ReadWrite" }
+                ]
+            }
+        }
+    ],
+    "NonBlockingFindings": []
+}
+```
+Exit code **2** (blocking). Reverted the widening; a follow-up `terraform plan` confirmed the
+infra config matches the last committed, clean state.
+
+### Deliberate finding #2: `check-no-public-access` catches a public bucket statement
+
+Added a second statement to the S3 bucket policy with `Principal = "*"`:
+
+```hcl
+{
+  Sid       = "DeliberatelyPublicRead"
+  Effect    = "Allow"
+  Principal = "*"
+  Action    = ["s3:GetObject"]
+  Resource  = "${aws_s3_bucket.app.arn}/*"
+}
+```
+
+```json
+{
+    "BlockingFindings": [
+        {
+            "findingType": "SECURITY_WARNING",
+            "code": "policy-analysis-CheckNoPublicAccess",
+            "message": "The resource policy grants public access for the given resource type.",
+            "resourceName": "gha-demo-app-123456789012",
+            "details": {
+                "result": "FAIL",
+                "reasons": [
+                    { "description": "Public access granted in the following statement with sid: DeliberatelyPublicRead.", "statementId": "DeliberatelyPublicRead" }
+                ]
+            }
+        }
+    ],
+    "NonBlockingFindings": []
+}
+```
+Exit code **2**. Reverted; `infra/main.tf` confirmed byte-identical to the last committed version.
+
+### Subcommand flag reference (confirmed by testing, not just the README)
+
+| Subcommand | Blocking-severity flag | Confirmed working |
+|---|---|---|
+| `validate` | `--treat-finding-type-as-blocking` | Yes — default already blocks `ERROR`/`SECURITY_WARNING` |
+| `check-no-new-access` | `--treat-findings-as-non-blocking` (opt *out* of blocking) | Yes — default blocks, as shown above |
+| `check-access-not-granted` | `--treat-findings-as-non-blocking` | Yes |
+| `check-no-public-access` | `--treat-findings-as-non-blocking` | Yes |
+
+`--config` and `--region` are required on every subcommand. The config file is an **`arnServiceMap`**
+(how to synthesize a fake ARN per resource type for the underlying AWS Access Analyzer API calls) —
+not, as the flag name might suggest, a list of actions to check.
+
+---
+
 *(Tutorial continues below as later phases are implemented and verified.)*
