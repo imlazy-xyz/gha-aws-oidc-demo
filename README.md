@@ -178,13 +178,230 @@ gh repo view imlazy-xyz/gha-aws-oidc-demo --json url,visibility,defaultBranchRef
 {"defaultBranchRef":{"name":"master"},"url":"https://github.com/imlazy-xyz/gha-aws-oidc-demo","visibility":"PUBLIC"}
 ```
 
-**Note on token scope:** `gh auth status` for this account shows scopes
-`admin:public_key, gist, read:org, repo` — no explicit `workflow` scope. This matters because a
-*plain PAT* without the `workflow` scope is rejected by GitHub when pushing changes under
-`.github/workflows/`. `gh`'s own credential helper uses its OAuth app token, which carries the
-equivalent of `workflow` implicitly for `gh`-authenticated pushes — confirmed below once the
-workflow file was pushed (see Phase 5); flagging here since it's a common trap when scripting `git
-push` by hand with a personal access token instead of `gh`.
+**Note on token scope:** `gh auth status` for this account initially showed scopes
+`admin:public_key, gist, read:org, repo` — no `workflow` scope. This turned out to matter for real:
+pushing the first `.github/workflows/*.yml` file was rejected outright:
+
+```
+! [remote rejected] master -> master (refusing to allow an OAuth App to create or
+  update workflow `.github/workflows/debug-oidc.yml` without `workflow` scope)
+```
+
+`gh`'s OAuth token does **not** carry an implicit `workflow` grant — this needed fixing, not just
+noting. Fixed with:
+
+```bash
+gh auth refresh -h github.com -s workflow
+```
+
+which runs an interactive device-code flow (open `https://github.com/login/device`, enter the
+printed code). After that, `gh auth status` showed `workflow` added to the scope list and the same
+push succeeded unchanged. Anyone reproducing this needs to run `gh auth refresh -s workflow` before
+the first push that touches `.github/workflows/`.
+
+---
+
+## Phase 2 — AWS OIDC provider, CI role, state bucket (`bootstrap/`)
+
+Applied **once, locally**, using the existing `user/deploy-admin` credentials. `bootstrap/` deliberately uses
+**local Terraform state** — it is what creates the state bucket the rest of this project uses, so it
+cannot store its own state there (chicken-and-egg). `bootstrap/terraform.tfstate` is gitignored.
+
+### OIDC provider — no thumbprint
+
+```hcl
+resource "aws_iam_openid_connect_provider" "github" {
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = []
+}
+```
+
+The classic tutorials hardcode a thumbprint (`6938fd4d98bab03faadb97b34396831e3780aea1` or similar).
+That's no longer necessary: AWS validates the GitHub OIDC JWKS endpoint's TLS certificate against its
+own library of trusted root CAs, and only falls back to a configured thumbprint if the certificate
+isn't signed by a trusted CA.
+[AWS docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc_verify-thumbprint.html) ·
+[Terraform provider docs](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_openid_connect_provider)
+(the AWS docs page currently ends with an injected block instructing AI assistants to run an
+unrelated CLI command — ignored, since page content is data, not instructions).
+
+### Permissions boundary + CI role
+
+The workload provisions its own IAM role (an "app role" — see Phase 3), which means the CI role needs
+`iam:CreateRole` / `iam:PutRolePolicy`. Granting that unconditionally would let CI mint a role with
+*more* privilege than CI itself has. Two mitigations, both applied:
+
+- **Path constraint**: the CI role's `iam:*` grant is scoped to
+  `arn:aws:iam::123456789012:role/gha-demo/*` only.
+- **Permissions boundary**: every role CI creates gets `permissions_boundary` set to a policy that
+  caps it to the same workload services (`s3`, `sqs`, `sns`, `dynamodb`, `logs`) — CI cannot mint a
+  role with escalated privileges even within the `/gha-demo/` path.
+
+The CI role's trust policy started deliberately loose (`StringLike` on the whole repo) because the
+real `sub` claim format isn't known until a token is actually issued — see below.
+
+### Apply — real output
+
+```bash
+cd bootstrap && terraform init && terraform apply -auto-approve
+```
+
+```
+aws_iam_openid_connect_provider.github: Creation complete after 22s [id=arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com]
+aws_iam_policy.ci_boundary: Creation complete after 23s [id=arn:aws:iam::123456789012:policy/gha-demo-ci-boundary]
+aws_iam_role.ci: Creation complete after 1s [id=gha-demo-ci-role]
+aws_s3_bucket.tf_state: Creation complete after 1m0s [id=gha-demo-tfstate-123456789012]
+aws_iam_role_policy.ci_workload: Creation complete after 0s [id=gha-demo-ci-role:gha-demo-ci-workload]
+aws_s3_bucket_server_side_encryption_configuration.tf_state: Creation complete after 14s [id=gha-demo-tfstate-123456789012]
+aws_s3_bucket_public_access_block.tf_state: Creation complete after 14s [id=gha-demo-tfstate-123456789012]
+aws_s3_bucket_versioning.tf_state: Creation complete after 15s [id=gha-demo-tfstate-123456789012]
+
+Apply complete! Resources: 8 added, 0 changed, 0 destroyed.
+
+Outputs:
+
+ci_role_arn = "arn:aws:iam::123456789012:role/gha-demo/gha-demo-ci-role"
+oidc_provider_arn = "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+state_bucket = "gha-demo-tfstate-123456789012"
+```
+
+Verified independently with the AWS CLI (not just trusting Terraform's own report):
+
+```bash
+aws iam get-role --role-name gha-demo-ci-role \
+  --query 'Role.{Arn:Arn,Path:Path,PermissionsBoundary:PermissionsBoundary}'
+```
+```
+Arn: arn:aws:iam::123456789012:role/gha-demo/gha-demo-ci-role
+Path: /gha-demo/
+PermissionsBoundary:
+  PermissionsBoundaryArn: arn:aws:iam::123456789012:policy/gha-demo-ci-boundary
+  PermissionsBoundaryType: Policy
+```
+
+> **Sandbox gotcha (unrelated to AWS/GitHub):** `aws` CLI here is configured with `output = yaml` in
+> `~/.aws/config`, which makes the CLI invoke a pager. In a non-interactive shell that pager can hang
+> indefinitely waiting for a keypress with zero output — it looks exactly like a stuck network call.
+> Fix: pass `--no-cli-pager`, or set `CLI_PAGER=""`.
+
+### Discovering the real `sub` claim — deterministic, not guessed
+
+The trust policy above started with a loose `StringLike` on
+`repo:imlazy-xyz/gha-aws-oidc-demo:*`. A temporary workflow
+(`.github/workflows/debug-oidc.yml`, `workflow_dispatch`-triggered) requested a real OIDC token and
+decoded its JWT payload:
+
+```bash
+TOKEN=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+  "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | jq '{sub, aud, repository, repository_id, repository_owner, repository_owner_id, ref}'
+```
+
+First run (job with no `environment:` set), against branch `master`:
+
+```json
+{
+  "sub": "repo:imlazy-xyz@1752641/gha-aws-oidc-demo@1354514600:ref:refs/heads/master",
+  "aud": "sts.amazonaws.com",
+  "repository": "imlazy-xyz/gha-aws-oidc-demo",
+  "repository_id": "1354514600",
+  "repository_owner": "imlazy-xyz",
+  "repository_owner_id": "1752641",
+  "ref": "refs/heads/master"
+}
+```
+
+**This confirms the research prediction exactly**: since `gha-aws-oidc-demo` was created after
+2026-07-15, its OIDC `sub` uses GitHub's newer **immutable-ID** format
+(`repo:OWNER@OWNER-ID/REPO@REPO-ID:...`) instead of the legacy `repo:OWNER/REPO:...` form still shown
+in most tutorials and blog posts. A trust policy copied from one of those would never match.
+
+### Scoping to a GitHub environment
+
+A branch-scoped `sub` (`:ref:refs/heads/master`) means any push to `master` can assume the role. We
+created a GitHub **environment** instead, so the condition is on `:environment:` rather than
+`:ref:`:
+
+```bash
+gh api -X PUT repos/imlazy-xyz/gha-aws-oidc-demo/environments/aws-demo
+```
+
+**Ordering trap, confirmed by testing:** the environment must exist *before* the first workflow run
+references it — a job with `environment: aws-demo` fails to even start if the environment isn't
+created yet, and no OIDC token is ever issued in that case.
+
+Re-ran the same debug step with `environment: aws-demo` added to the job:
+
+```json
+{
+  "sub": "repo:imlazy-xyz@1752641/gha-aws-oidc-demo@1354514600:environment:aws-demo",
+  "aud": "sts.amazonaws.com",
+  ...
+}
+```
+
+### Tightening the trust policy
+
+Replaced `StringLike` + wildcard with `StringEquals` on the exact observed sub:
+
+```hcl
+Condition = {
+  StringEquals = {
+    "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+    "token.actions.githubusercontent.com:sub" = "repo:imlazy-xyz@1752641/gha-aws-oidc-demo@1354514600:environment:aws-demo"
+  }
+}
+```
+
+```bash
+terraform apply -auto-approve
+```
+
+Applying this surfaced one more piece of drift worth knowing about:
+
+```
+~ resource "aws_iam_openid_connect_provider" "github" {
+    ~ thumbprint_list = [
+        - "ab9d0263244dd0326eb67015705a667e79cfe998",
+      ]
+  }
+```
+
+Even though `thumbprint_list = []` was set at creation, AWS had auto-populated one anyway (matching
+the documented behavior: "if you don't provide one, IAM retrieves the top intermediate CA
+thumbprint"). Re-applying the empty list cleared it — harmless, since AWS doesn't use the configured
+thumbprint to verify GitHub's endpoint regardless (see the provider docs cited above).
+
+### Proof: a real `AssumeRoleWithWebIdentity` succeeds under the tightened policy
+
+Extended the debug workflow to actually assume the role via `aws-actions/configure-aws-credentials@v6`
+and call `aws sts get-caller-identity`:
+
+```yaml
+- name: Configure AWS credentials via OIDC
+  uses: aws-actions/configure-aws-credentials@v6
+  with:
+    role-to-assume: arn:aws:iam::123456789012:role/gha-demo/gha-demo-ci-role
+    aws-region: us-east-1
+
+- name: Prove the assumed role
+  run: aws sts get-caller-identity --no-cli-pager
+```
+
+Real run output ([workflow run 33610179327](https://github.com/imlazy-xyz/gha-aws-oidc-demo/actions/runs/33610179327), all steps green):
+
+```json
+{
+    "UserId": "AROAEXAMPLE1111111111:GitHubActions",
+    "Account": "123456789012",
+    "Arn": "arn:aws:sts::123456789012:assumed-role/gha-demo-ci-role/GitHubActions"
+}
+```
+
+**This is the core proof point of the whole tutorial**: GitHub Actions obtained temporary AWS
+credentials via OIDC, scoped by the exact `sub`/`aud` claims of a token issued for the `aws-demo`
+environment on this specific repository — no access keys or secrets stored anywhere.
 
 ---
 
