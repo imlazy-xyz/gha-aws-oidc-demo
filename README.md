@@ -545,4 +545,76 @@ live trust policy back — only the OIDC federated principal remains.
 
 ---
 
+### Gotcha: orphaned IAM principal after a role destroy/recreate
+
+Before moving to the validator, a routine `terraform plan` on `infra/` surfaced two more real
+problems worth recording.
+
+**1. Stale S3-native lock from a killed process.** An earlier `terraform plan` was killed after
+hitting a 60s foreground timeout. `use_lockfile` locking does not auto-release on SIGTERM, so the
+next command failed:
+
+```
+Error: Error acquiring the state lock
+... api error PreconditionFailed: At least one of the pre-conditions you specified did not hold
+Lock Info:
+  ID: d9bba9aa-faca-885a-f847-c0ef76231f9c
+```
+
+Fixed with `terraform force-unlock -force <lock-id>`. Worth knowing: S3-native locking trades the
+old DynamoDB lock table for a lock file, but a killed process can still strand a lock exactly like
+the DynamoDB approach could.
+
+**2. Orphaned IAM principal in the S3/SQS/SNS resource policies.** During Phase 3, `aws_iam_role.app`
+was destroyed and recreated once (a leftover from an earlier failed apply attempt). AWS resource
+policies (S3 bucket policy, SQS queue policy, SNS topic policy) store an IAM principal's **internal
+unique ID**, not its ARN text, at write time. When the role behind that unique ID was deleted and
+recreated, the stored ID became orphaned — silently, since Terraform's state still showed the ARN it
+originally wrote.
+
+The next `terraform plan` showed the drift plainly for two of the three resources:
+
+```
+# aws_s3_bucket_policy.app will be updated in-place
+  ~ Principal = {
+      ~ AWS = "AROAEXAMPLE2222222222" -> "arn:aws:iam::123456789012:role/gha-demo/gha-demo-app-role"
+    }
+# aws_sqs_queue_policy.app will be updated in-place  (same pattern)
+```
+
+But for SNS, the provider's own *read* of the topic failed outright, blocking the plan before it
+could even show a diff:
+
+```
+Error: reading SNS Topic (arn:aws:sns:us-east-1:123456789012:gha-demo-app-topic): contains invalid principals
+```
+
+Confirmed directly against the live policy:
+
+```bash
+aws sns get-topic-attributes --topic-arn arn:aws:sns:us-east-1:123456789012:gha-demo-app-topic \
+  --query 'Attributes.Policy' --output text | jq .
+```
+```json
+{"Statement": [{"Principal": {"AWS": "AROAEXAMPLE2222222222"}, ...}]}
+```
+
+Since Terraform couldn't even read past this to plan a fix, it was fixed directly:
+
+```bash
+aws sns set-topic-attributes --topic-arn arn:aws:sns:us-east-1:123456789012:gha-demo-app-topic \
+  --attribute-name Policy --attribute-value file://sns-policy-fixed.json
+```
+
+Then `terraform apply` cleanly reconciled the remaining S3/SQS drift, and a follow-up
+`terraform plan` confirmed: `No changes. Your infrastructure matches the configuration.`
+
+**Takeaway:** destroying and recreating an IAM role that other resource policies reference by ARN can
+silently break those policies at the AWS level, even though the ARN string is unchanged — because
+AWS resolves the ARN to an internal ID once, at write time, and never re-resolves it. This is a real
+argument for `create_before_destroy` lifecycle rules on IAM roles referenced elsewhere, noted here
+rather than retrofitted, since the failure only shows up after the fact.
+
+---
+
 *(Tutorial continues below as later phases are implemented and verified.)*
