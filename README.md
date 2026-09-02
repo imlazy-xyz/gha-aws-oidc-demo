@@ -7,6 +7,21 @@ access keys), running Terraform from CI, and gating the IAM policies involved wi
 Every command below was actually run against a real AWS account and a real GitHub repo. Where
 something failed, the failure and the fix are recorded rather than smoothed over.
 
+**Repo structure:** `bootstrap/` (OIDC provider, CI role, state bucket — applied once, locally) ·
+`infra/` (the disposable demo workload — applied by CI) · `policy-validator/` (validator config +
+reference policy) · `.github/workflows/terraform.yml` (the CI pipeline).
+
+**Contents:** [Prerequisites](#prerequisites) ·
+[Phase 0 — De-risking the validator](#phase-0--de-risking-the-validator-against-terraform-116) ·
+[Phase 1 — GitHub repo](#phase-1--github-repository) ·
+[Phase 2 — OIDC provider + CI role](#phase-2--aws-oidc-provider-ci-role-state-bucket-bootstrap) ·
+[Phase 3 — Workload + CI permissions](#phase-3--disposable-workload--iteratively-earned-ci-permissions) ·
+[Phase 4 — Validator integration](#phase-4--validator-integration-against-the-real-infra) ·
+[Phase 5 — Workflow](#phase-5--github-actions-workflow) ·
+[Phase 6 — Running it for real](#phase-6--running-the-workflow-for-real) ·
+[Phase 7 — Cleanup](#phase-7--final-cleanup) ·
+[Summary](#summary) · [References](#references)
+
 ## Prerequisites
 
 - `aws` CLI, authenticated, pointed at the target account.
@@ -970,4 +985,86 @@ once confirmed from outside it.
 
 ---
 
-*(Tutorial continues below as later phases are implemented and verified.)*
+## Phase 7 — Final cleanup
+
+`infra/` was already destroyed and verified as part of every workflow run (Phase 6). What remains is
+`bootstrap/` — the OIDC provider, CI role, permissions boundary, and state bucket.
+
+```bash
+cd bootstrap
+terraform destroy -auto-approve
+```
+
+Everything except the S3 state bucket destroyed cleanly. The bucket failed as documented in the plan:
+
+```
+Error: deleting S3 Bucket (gha-demo-tfstate-123456789012): operation error S3: DeleteBucket,
+... api error BucketNotEmpty: The bucket you tried to delete is not empty. You must delete all
+versions in the bucket.
+```
+
+Versioned buckets keep every historical version plus delete markers; emptying the *current* objects
+isn't enough. Purged all versions and delete markers before retrying:
+
+```bash
+aws s3api list-object-versions --bucket gha-demo-tfstate-123456789012 --output json > versions.json
+jq '{Objects: ([.Versions[]? | {Key, VersionId}] + [.DeleteMarkers[]? | {Key, VersionId}])}' versions.json > purge.json
+aws s3api delete-objects --bucket gha-demo-tfstate-123456789012 --delete file://purge.json
+```
+
+44 objects/markers purged (27 versions + 17 delete markers — the accumulated history of `infra/`'s
+state file and its S3-native lock file across every apply/destroy cycle in this tutorial). Confirmed
+empty with `aws s3api list-object-versions`, then:
+
+```bash
+terraform destroy -auto-approve
+```
+```
+Destroy complete! Resources: 1 destroyed.
+```
+
+### Final verification — the whole account, independently
+
+```bash
+aws iam list-open-id-connect-providers                                          # -> []
+aws iam list-roles --path-prefix /gha-demo/ --query 'Roles[].RoleName'          # -> []
+aws iam list-policies --scope Local --query "Policies[?starts_with(PolicyName, 'gha-demo')].PolicyName"  # -> []
+aws s3 ls | grep gha-demo                                                        # -> (no output)
+```
+
+All four checks return empty. Every AWS resource created anywhere in this tutorial — OIDC provider,
+CI role, permissions boundary, app role, S3/SQS/SNS/DynamoDB/CloudWatch resources, state bucket — has
+been destroyed and confirmed gone by direct query, not by trusting Terraform's own report.
+
+---
+
+## Summary
+
+| Phase | Outcome |
+|---|---|
+| 0 — De-risk validator | Issue #42 reproduced on Terraform 1.16.0; fixed with a `jq` pre-filter |
+| 1 — GitHub repo | Created; needed `gh auth refresh -s workflow` before the first workflow-file push |
+| 2 — OIDC + CI role | No thumbprint needed; `sub` confirmed to use the new immutable-ID format; real `AssumeRoleWithWebIdentity` proven |
+| 3 — Workload + CI perms | 6 resources, 3 real `AccessDenied` iterations, all within the 6-iteration budget |
+| 4 — Validator wiring | Found and fixed a second real validator bug (`arnServiceMap` missing `?`); 2 deliberate findings caught and reverted |
+| 5 — Workflow | Full plan → 4 gates → apply → verify → destroy; a real `pipefail` bug caught before shipping |
+| 6 — Real run | First run failed on a genuine boundary gap (fixed); second run fully green, independently verified |
+| 7 — Cleanup | Account confirmed empty by direct query across every resource type touched |
+
+**Real problems found and fixed along the way** (not simulated, all reproduced against live AWS/
+GitHub/Terraform): the plan-JSON `identity` crash (issue #42), the `arnServiceMap` missing-`?` crash
+(a second, previously undocumented validator bug), the immutable-ID `sub` claim format, a stale
+S3-native lock from a killed process, an orphaned IAM principal after a role destroy/recreate, a
+permissions boundary blocking the CI role's own `access-analyzer` calls, and a GitHub Actions
+`pipefail` footgun in the teardown-verification step.
+
+## References
+
+- [awslabs/terraform-iam-policy-validator](https://github.com/awslabs/terraform-iam-policy-validator) — the validator itself; [issue #42](https://github.com/awslabs/terraform-iam-policy-validator/issues/42) (plan-JSON identity fields)
+- [tf-policy-validator on PyPI](https://pypi.org/project/tf-policy-validator/)
+- [GitHub: Configuring OpenID Connect in AWS](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-aws)
+- [GitHub: OIDC reference](https://docs.github.com/en/actions/reference/security/oidc) (sub claim formats, immutable IDs)
+- [AWS: OIDC thumbprint verification](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc_verify-thumbprint.html)
+- [Terraform: aws_iam_openid_connect_provider](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_openid_connect_provider)
+- [aws-actions/configure-aws-credentials](https://github.com/aws-actions/configure-aws-credentials)
+- [Terraform: S3 backend, `use_lockfile`](https://developer.hashicorp.com/terraform/language/backend/s3)
