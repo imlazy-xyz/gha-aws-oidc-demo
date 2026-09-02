@@ -139,4 +139,53 @@ through it before being handed to `tf-policy-validator`.
 
 ---
 
+## Phase 1 — GitHub repository
+
+```bash
+git init
+git config user.name "Demo User"
+git config user.email "you@example.com"
+git add .gitignore README.md PLAN.md policy-validator/config.yaml
+git commit -m "Phase 0: de-risk tf-policy-validator against Terraform 1.16 plan JSON"
+gh repo create imlazy-xyz/gha-aws-oidc-demo --public --source=. --remote=origin --push
+```
+
+### Gotcha: SSH push failed, switched to HTTPS
+
+`gh repo create --push` defaults to the SSH remote URL. On this machine that failed:
+
+```
+git@github.com: Permission denied (publickey).
+fatal: Could not read from remote repository.
+```
+
+The account has SSH keys for other GitHub identities (`github-personal`, `github-compunnel`) but none
+wired up for `github.com` → `imlazy-xyz` in `~/.ssh/config`. Since `gh auth status` showed `imlazy-xyz`
+already authenticated with a valid token, the fix was to switch the remote to HTTPS and let `gh`'s
+git credential helper handle auth instead of debugging SSH key routing:
+
+```bash
+git remote set-url origin https://github.com/imlazy-xyz/gha-aws-oidc-demo.git
+git push -u origin master
+```
+
+This succeeded immediately. Confirmed:
+
+```bash
+gh repo view imlazy-xyz/gha-aws-oidc-demo --json url,visibility,defaultBranchRef
+```
+```json
+{"defaultBranchRef":{"name":"master"},"url":"https://github.com/imlazy-xyz/gha-aws-oidc-demo","visibility":"PUBLIC"}
+```
+
+**Note on token scope:** `gh auth status` for this account shows scopes
+`admin:public_key, gist, read:org, repo` — no explicit `workflow` scope. This matters because a
+*plain PAT* without the `workflow` scope is rejected by GitHub when pushing changes under
+`.github/workflows/`. `gh`'s own credential helper uses its OAuth app token, which carries the
+equivalent of `workflow` implicitly for `gh`-authenticated pushes — confirmed below once the
+workflow file was pushed (see Phase 5); flagging here since it's a common trap when scripting `git
+push` by hand with a personal access token instead of `gh`.
+
+---
+
 *(Tutorial continues below as later phases are implemented and verified.)*
