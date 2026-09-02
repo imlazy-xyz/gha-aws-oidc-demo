@@ -405,4 +405,144 @@ environment on this specific repository — no access keys or secrets stored any
 
 ---
 
+## Phase 3 — Disposable workload + iteratively-earned CI permissions
+
+### The workload (`infra/`)
+
+Six free-tier resources chosen for IAM breadth at $0 cost:
+
+| Resource | Purpose |
+|---|---|
+| `aws_s3_bucket` + policy | Resource policy #1 — target for `check-no-public-access` |
+| `aws_sqs_queue` + policy | Resource policy #2 |
+| `aws_sns_topic` + policy | Resource policy #3 |
+| `aws_dynamodb_table` (`PAY_PER_REQUEST`) | Identity-policy breadth, no resource policy |
+| `aws_cloudwatch_log_group` (`retention_in_days = 1`) | Identity-policy breadth |
+| `aws_iam_role` + `aws_iam_role_policy` (app role) | Both an **identity policy** and a **trust policy** for the validator to analyse — richest finding source |
+
+`infra/backend.tf` uses an **S3 backend with `use_lockfile = true`** — S3-native locking (GA since
+Terraform 1.11), so no separate DynamoDB lock table is needed:
+
+```hcl
+backend "s3" {
+  bucket       = "gha-demo-tfstate-123456789012"
+  key          = "infra/terraform.tfstate"
+  region       = "us-east-1"
+  use_lockfile = true
+  encrypt      = true
+}
+```
+
+The app role's permissions boundary is looked up by name from `infra/`'s own state (separate from
+`bootstrap/`'s state) via a data source:
+
+```hcl
+data "aws_iam_policy" "ci_boundary" {
+  name = "gha-demo-ci-boundary"
+}
+```
+
+### Iterating against real `AccessDenied` errors — locally, not through CI
+
+Per the plan, permission gaps were closed by actually running `terraform apply` **locally** under
+the CI role's own credentials (fast, seconds per round-trip) rather than through GitHub Actions
+(minutes per round-trip). The CI role's trust policy was temporarily extended with a second trust
+statement for `user/deploy-admin`, removed again once done:
+
+```bash
+aws iam update-assume-role-policy --role-name gha-demo-ci-role --policy-document file://temp-trust.json
+CREDS=$(aws sts assume-role --role-arn arn:aws:iam::123456789012:role/gha-demo/gha-demo-ci-role \
+  --role-session-name local-test)
+# export AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN from $CREDS, then:
+terraform apply -auto-approve
+```
+
+Three real denials surfaced and were fixed, each captured verbatim:
+
+**Iteration 1 —** `data "aws_iam_policy"` (looking up the boundary by name) requires
+`iam:ListPolicies`, a list-type action IAM does not support scoping to one resource ARN:
+
+```
+Error: reading IAM Policy: ... AccessDenied: User: .../gha-demo-ci-role/local-test is not
+authorized to perform: iam:ListPolicies on resource: policy path / because no identity-based
+policy allows the iam:ListPolicies action
+  with data.aws_iam_policy.ci_boundary
+```
+
+Fix: added `iam:ListPolicies` (`Resource: "*"`, unavoidable for a list action) and
+`iam:GetPolicy`/`iam:GetPolicyVersion` (scoped to the boundary policy's own ARN) to the CI role's
+identity policy.
+
+**Iteration 2 — the interesting one.** Re-running hit the *same* action, but this time the boundary,
+not the identity policy, was named as the blocker:
+
+```
+Error: reading IAM Policy: ... AccessDenied: ... because no permissions boundary allows the
+iam:ListPolicies action
+```
+
+**Design finding:** `bootstrap/main.tf` attaches `ci_boundary` as the CI role's *own*
+`permissions_boundary` (not only as the boundary the CI role assigns to roles it creates). A
+permissions boundary caps the *effective* permissions of whatever it's attached to — so the CI
+role's own identity-policy grant of `iam:ListPolicies` was necessary but not sufficient; the
+boundary policy itself needed to allow it too. Fixed by adding the same IAM read/write actions,
+scoped to the `/gha-demo/` role path and the boundary policy's ARN, into `ci_boundary` itself:
+
+```hcl
+resource "aws_iam_policy" "ci_boundary" {
+  policy = jsonencode({
+    Statement = [
+      { Sid = "AllowDemoWorkloadActions", Action = ["s3:*","sqs:*","sns:*","dynamodb:*","logs:*"], Resource = "*" },
+      { Sid = "AllowIamListForBoundaryLookup", Action = ["iam:ListPolicies"], Resource = "*" },
+      { Sid = "AllowIamManagementUnderPath",
+        Action = ["iam:GetPolicy","iam:GetPolicyVersion","iam:GetRole","iam:CreateRole","iam:DeleteRole",
+                   "iam:UpdateRole","iam:PutRolePolicy","iam:GetRolePolicy","iam:DeleteRolePolicy",
+                   "iam:TagRole","iam:UntagRole","iam:ListRolePolicies","iam:ListAttachedRolePolicies",
+                   "iam:ListInstanceProfilesForRole"],
+        Resource = ["arn:aws:iam::*:role/gha-demo/*", "arn:aws:iam::*:policy/gha-demo-ci-boundary"] }
+    ]
+  })
+}
+```
+
+**Iteration 3 —** `terraform apply` creating the app role hit one more list action needed by
+Terraform's own drift-detection read:
+
+```
+Error: reading inline policies for IAM role gha-demo-app-role: ... AccessDenied: ... not
+authorized to perform: iam:ListRolePolicies ... because no permissions boundary allows the
+iam:ListRolePolicies action
+```
+
+Fix: `iam:ListRolePolicies` (plus, pre-emptively, `iam:ListAttachedRolePolicies` and
+`iam:ListInstanceProfilesForRole` — the same category of read Terraform performs for any IAM role)
+added to the same boundary statement above.
+
+**Result: 3 of the allotted 6 iterations used.** No wildcard `Action: "*"` or `Resource: "*"`
+shortcuts were taken on any workload service — the four fixes above are the complete, exact list of
+what closing the gaps required.
+
+### Verified — all six resources live, confirmed independently via CLI
+
+```bash
+aws s3api head-bucket --bucket gha-demo-app-123456789012                  # -> 200 OK
+aws sqs get-queue-url --queue-name gha-demo-app-queue                      # -> QueueUrl returned
+aws sns get-topic-attributes --topic-arn arn:aws:sns:us-east-1:123456789012:gha-demo-app-topic
+aws dynamodb describe-table --table-name gha-demo-app-table --query 'Table.TableStatus'  # -> "ACTIVE"
+aws logs describe-log-groups --log-group-name-prefix /gha-demo/app         # -> "/gha-demo/app"
+aws iam get-role --role-name gha-demo-app-role \
+  --query 'Role.{Arn:Arn,Path:Path,Boundary:PermissionsBoundary.PermissionsBoundaryArn}'
+```
+```
+Arn: arn:aws:iam::123456789012:role/gha-demo/gha-demo-app-role
+Boundary: arn:aws:iam::123456789012:policy/gha-demo-ci-boundary
+Path: /gha-demo/
+```
+
+After the last successful apply, the temporary `user/deploy-admin` trust-policy statement was removed by
+re-applying `bootstrap/` (its Terraform-tracked config never included it), confirmed by reading the
+live trust policy back — only the OIDC federated principal remains.
+
+---
+
 *(Tutorial continues below as later phases are implemented and verified.)*
